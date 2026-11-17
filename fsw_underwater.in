@@ -1,0 +1,219 @@
+# =====================================================================
+#  Underwater friction stir welding (UFSW) - LAMMPS template
+#  BUTT WELD of two plates, seam along x at y = Ly/2
+#  Plate A   : Al (EAM)                 type 1   retreating side (y > seam)
+#  Plate B   : Al or Cu (EAM)           type 4   advancing side  (y < seam)
+#  Tool      : rigid diamond            type 2   (rotates + plunges + traverses)
+#  Water     : mW coarse-grained water  type 3
+#
+#  Al-Al wet : lmp -in fsw_underwater.in
+#  Al-Cu wet : lmp -in fsw_underwater.in -var cu 1
+#  Dry ref.  : add  -var wet 0
+#  Pin offset into plate A (common for dissimilar welds): -var yoff 3
+#  Units: metal (eV, Angstrom, ps)
+# =====================================================================
+variable wet   index 1
+variable seed  index 48279
+variable scale index 1.0          # set <1 for quick tests (shrinks box)
+variable cu    index 0            # 0 = Al/Al, 1 = Al/Cu (Cu on advancing side)
+variable sgap  index 2.0          # seam clearance between plates (A)
+variable yoff  index 0.0          # tool offset from seam (+ = towards Al plate A)
+
+if "${cu} == 1" then &
+  "variable el2 string Cu" &
+  "variable m2  equal 63.546" &
+  "variable a2c equal 3.615" &
+  "variable D2  equal 0.087" "variable al2 equal 5.14" "variable r2 equal 2.05" &
+  "variable e2w equal 0.0150" "variable s2w equal 2.75" &
+else &
+  "variable el2 string Al" &
+  "variable m2  equal 26.982" &
+  "variable a2c equal 4.05" &
+  "variable D2  equal 0.28" "variable al2 equal 2.78" "variable r2 equal 2.20" &
+  "variable e2w equal 0.0135" "variable s2w equal 2.90"
+
+units        metal
+atom_style   atomic
+boundary     p p f
+dimension    3
+
+# ---------------- geometry (Angstrom) --------------------------------
+variable nx   equal round(59*${scale})          # whole Al cells -> clean periodic x
+variable ny   equal 2*round(15*${scale})
+variable Lx   equal ${nx}*4.05
+variable Ly   equal ${ny}*4.05
+variable a2   equal ${Lx}/round(${Lx}/${a2c})   # plate B lattice, strained <0.2% to fit box
+variable zAl  index 26            # Al plate thickness = top surface z (pin reaches ~60% depth)
+variable zW   equal ${zAl}+40     # water top (~13 A above shoulder)
+variable xc0  equal 70*${scale}   # tool start x
+variable yc   equal ${Ly}/2               # seam position
+variable yt   equal ${yc}+${yoff}         # tool axis
+variable Rp   equal 10            # pin radius
+variable Lp   equal 15            # pin length
+variable Rs   equal 25            # shoulder radius
+variable Hs   equal 10            # shoulder height
+variable gap  equal 2             # pin tip above surface at start
+variable zp0  equal ${zAl}+${gap}
+variable zs0  equal ${zp0}+${Lp}
+variable zs1  equal ${zs0}+${Hs}
+
+variable zhi  equal ${zW}+10
+region  box block 0 ${Lx} 0 ${Ly} -5 ${zhi} units box
+create_box 4 box
+
+# Two plates, butted along the seam (y = yc) with a small clearance
+variable     yA equal ${yc}+0.5*${sgap}
+variable     yB equal ${yc}-0.5*${sgap}
+lattice      fcc 4.05
+region       plateA block INF INF ${yA} INF 0 ${zAl} units box
+create_atoms 1 region plateA
+lattice      fcc ${a2}
+region       plateB block INF INF INF ${yB} 0 ${zAl} units box
+create_atoms 4 region plateB
+
+# Tool (pin + shoulder), diamond lattice
+lattice      diamond 3.567
+region       pin      cylinder z ${xc0} ${yt} ${Rp} ${zp0} ${zs0} units box
+region       shoulder cylinder z ${xc0} ${yt} ${Rs} ${zs0} ${zs1} units box
+region       toolr union 2 pin shoulder
+create_atoms 2 region toolr
+
+# Water layer (mW, ~1 g/cm3 on a simple-cubic seed lattice)
+region       pinO      cylinder z ${xc0} ${yt} ${Rp} ${zp0} ${zs0} side out units box
+region       shoulderO cylinder z ${xc0} ${yt} ${Rs} ${zs0} ${zs1} side out units box
+variable     zw0 equal ${zAl}+2.5
+region       wblock block INF INF INF INF ${zw0} ${zW} units box
+region       waterr intersect 3 wblock pinO shoulderO
+lattice      sc 3.104
+create_atoms 3 region waterr
+
+mass 1 26.982
+mass 2 12.011
+mass 3 18.015
+mass 4 ${m2}
+
+group plA   type 1
+group plB   type 4
+group metal type 1 4
+group tool  type 2
+group water type 3
+
+# ---------------- interactions ---------------------------------------
+# Al-Al : EAM.  Swap in Mishin Al99.eam.alloy if you have it.
+# Al-Al, Al-Cu, Cu-Cu : all from AlCu.eam.alloy
+# Al-C  : Morse (values used in Al/diamond cutting MD - check for your tool)
+# X-mW  : LJ - CALIBRATE epsilon vs. water contact angle / Kapitza conductance
+pair_style   hybrid eam/alloy sw morse 8.0 lj/cut 10.0
+pair_coeff   * * eam/alloy AlCu.eam.alloy Al NULL NULL ${el2}
+pair_coeff   * * sw mW.sw NULL NULL mW NULL
+pair_coeff   1 2 morse 0.28 2.78 2.20
+pair_coeff   1 3 lj/cut 0.0135 2.90
+pair_coeff   2 4 morse ${D2} ${al2} ${r2}
+pair_coeff   3 4 lj/cut ${e2w} ${s2w}
+pair_coeff   2 3 lj/cut 0.0050 3.20
+pair_coeff   2 2 none
+neighbor     2.0 bin
+neigh_modify delay 0 every 1 check yes exclude type 2 2
+
+delete_atoms overlap 2.6 water tool
+if "${wet} == 0" then "delete_atoms group water"
+
+# ---------------- boundary layers ------------------------------------
+region  fixr  block INF INF INF INF INF 3  units box   # rigid backing plate (anvil)
+region  bathr block INF INF INF INF 3   6  units box   # heat sink into backing plate
+variable zwt  equal ${zW}-8
+region  wtopr block INF INF INF INF ${zwt} INF units box
+group   fixed  region fixr
+group   bathT  region bathr
+group   bath   intersect bathT metal
+group   wtopT  region wtopr
+group   wtop   intersect wtopT water
+group   mobile subtract all fixed tool
+
+fix  hold   fixed setforce 0 0 0
+fix  thold  tool  setforce 0 0 0
+fix  wall   water wall/lj93 zhi EDGE 0.01 3.0 3.0 units box
+
+timestep 0.001
+min_style cg
+minimize 1e-6 1e-8 2000 20000
+
+# ---------------- equilibrate at 300 K -------------------------------
+velocity mobile create 300 ${seed} dist gaussian mom yes rot no
+velocity fixed  set 0 0 0
+velocity tool   set 0 0 0
+fix  nve    mobile nve
+fix  lgEq   mobile langevin 300 300 0.1 ${seed}   # whole system during equilibration
+if "${wet} == 1" then "fix lgW wtop langevin 300 300 0.5 ${seed}"
+# wtop = "far-field" water reservoir held at 300 K (acts as the heat sink)
+
+compute tM metal temp
+thermo_style custom step temp c_tM pe press
+thermo 1000
+run 20000                                   # 20 ps
+
+# ---------------- welding: plunge -> dwell -> traverse ---------------
+reset_timestep 0
+unfix thold
+unfix lgEq
+fix  lgAl   bath langevin 300 300 0.1 ${seed}   # far-field heat sink in the plate
+variable dt     equal 0.001
+variable w      equal 0.05      # rad/ps   (shoulder rim ~125 m/s)
+variable vp     equal 0.10      # A/ps plunge speed
+variable dpl    equal ${gap}+${Lp}+0.5      # shoulder 0.5 A into surface
+variable tp     equal ${dpl}/${vp}          # plunge time (ps)
+variable tdw    equal 20                    # dwell (ps)
+variable t1     equal ${tp}+${tdw}
+variable vt     equal 0.25      # A/ps traverse speed
+variable Ltr    equal 60*${scale}           # traverse length
+variable ttr    equal ${Ltr}/${vt}
+
+variable t      equal step*${dt}
+variable th     equal ${w}*v_t
+variable zsh    equal ternary(v_t<${tp},-${vp}*v_t,-${dpl})
+variable vzc    equal ternary(v_t<${tp},-${vp},0.0)
+variable xsh    equal ternary(v_t>${t1},${vt}*(v_t-${t1}),0.0)
+variable vxc    equal ternary(v_t>${t1},${vt},0.0)
+
+fix orig tool store/state 0 x y z
+variable rx atom f_orig[1]-${xc0}
+variable ry atom f_orig[2]-${yt}
+variable dx atom v_xsh+v_rx*(cos(v_th)-1.0)-v_ry*sin(v_th)
+variable dy atom v_rx*sin(v_th)+v_ry*(cos(v_th)-1.0)
+variable vx atom v_vxc-${w}*(v_rx*sin(v_th)+v_ry*cos(v_th))
+variable vy atom ${w}*(v_rx*cos(v_th)-v_ry*sin(v_th))
+fix spin tool move variable v_dx v_dy v_zsh v_vx v_vy v_vzc
+
+# ---------------- outputs --------------------------------------------
+# tool forces (Fz = plunge force, Fx = traverse force) and torque
+variable xcn equal ${xc0}+v_xsh
+variable tq  atom (x-v_xcn)*fy-(y-${yt})*fx
+compute  Ft  tool reduce sum fx fy fz
+compute  Tq  tool reduce sum v_tq
+thermo_modify norm no
+
+# surface temperature map (5 A bins, top 15 A of Al, flow velocity removed)
+variable ztop equal ${zAl}-15
+region   topAl block INF INF INF INF ${ztop} INF units box
+compute  bins metal chunk/atom bin/2d x lower 5.0 y lower 5.0 region topAl units box
+compute  Tc  metal temp/chunk bins temp com yes
+fix      Tmap all ave/time 100 10 1000 c_Tc[1] mode vector file Tmap.dat
+
+# material mixing: number of plate-B atoms carried across the weld seam
+# (only counts within Ly/4 of the seam; the box is periodic in y, so the
+#  plates also touch at y = 0 / Ly - a second, far-away, inert interface)
+variable inA  atom (type==4)*(y>${yc})*(y<${yc}+0.25*${Ly})
+compute  mix  plB reduce sum v_inA
+thermo_style custom step v_t c_tM c_Ft[1] c_Ft[2] c_Ft[3] c_Tq c_mix v_xsh v_zsh
+
+# per-atom data for OVITO (colour by type to see the two plates mix;
+# CNA cutoff fits Al - for Al/Cu use OVITO's adaptive CNA instead)
+compute  cna metal cna/atom 3.46
+compute  ke  all ke/atom
+variable Tat atom c_ke/(1.5*8.617333e-5)
+dump     d1 all custom 2000 dump.fsw.* id type x y z vx vy vz c_cna v_Tat
+dump_modify d1 pad 6
+
+variable nrun equal round((${t1}+${ttr})/${dt})
+run ${nrun}
+write_data fsw_final.data nocoeff
